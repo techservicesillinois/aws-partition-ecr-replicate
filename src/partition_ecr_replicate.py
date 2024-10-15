@@ -24,6 +24,7 @@ from uuid import uuid4
 import boto3
 from boto3.dynamodb import conditions
 import docker
+from docker.errors import DockerException
 
 DST_REPO_REGION = os.environ.get('DEST_REPO_REGION')
 DST_REGISTRY_ID = os.environ.get('DEST_REGISTRY_ID')
@@ -59,7 +60,11 @@ ECRRegistry = namedtuple('ECRRegistry', ['url', 'clnt'])
 logger = logging.getLogger(__name__)
 logger.setLevel(LOGGING_LEVEL)
 
-docker_clnt = docker.from_env()
+try:
+    docker_clnt = docker.from_env()
+except DockerException:
+    logger.warning('Unable to connect to Docker')
+    docker_clnt = None
 
 ddb_rsrc = boto3.resource('dynamodb')
 ecs_clnt = boto3.client('ecs')
@@ -642,6 +647,9 @@ def main(records_id):
 
     if not records_id:
         raise ValueError('records_id is required')
+
+    if not docker_clnt:
+        raise ValueError('Docker is not available')
 
     failure_message_ids = []
     def _failure(_record):
