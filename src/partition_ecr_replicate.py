@@ -331,7 +331,7 @@ def task_start(records_id, context, _logger):
     )
     res = ecs_clnt.run_task(
         cluster=IMAGES_TASK_CLUSTER,
-        task_definition=IMAGES_TASKDEF,
+        taskDefinition=IMAGES_TASKDEF,
         count=1,
         launchType='FARGATE',
         networkConfiguration={
