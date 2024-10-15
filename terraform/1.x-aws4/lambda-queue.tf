@@ -15,6 +15,23 @@ data "aws_iam_policy_document" "this_queue" {
         ]
         resources = [ aws_sqs_queue.images.arn ]
     }
+
+    statement {
+        sid = "DynamoDB"
+        effect = "Allow"
+
+        actions = [
+            "dynamodb:BatchGetItem",
+            "dynamodb:BatchWriteItem",
+            "dynamodb:DeleteItem",
+            "dynamodb:GetItem",
+            "dynamodb:PutItem",
+            "dynamodb:Query",
+            "dynamodb:Scan",
+            "dynamodb:UpdateItem",
+        ]
+        resources = [ aws_dynamodb_table.records.arn ]
+    }
 }
 
 # =========================================================
@@ -38,6 +55,7 @@ module "this_queue" {
         {
             LOGGING_LEVEL = local.partition == "aws" || local.is_debug ? "DEBUG" : "INFO"
 
+            IMAGES_QUEUE                = aws_sqs_queue.images.url
             IMAGES_TASKDEF              = aws_ecs_task_definition.this_worker.arn
             IMAGES_TASK_CLUSTER         = var.ecs_cluster_name
             IMAGES_TASK_SECURITY_GROUPS = aws_security_group.this_worker.id
