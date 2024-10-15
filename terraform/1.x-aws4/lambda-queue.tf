@@ -41,7 +41,7 @@ module "this_queue" {
             IMAGES_TASKDEF              = aws_ecs_task_definition.this_worker.arn
             IMAGES_TASK_CLUSTER         = var.ecs_cluster_name
             IMAGES_TASK_SECURITY_GROUPS = aws_security_group.this_worker.id
-            IMAGES_TASK_SUBNETS         = join(",", var.subnet_ids)
+            IMAGES_TASK_SUBNETS         = join(",", local.subnet_ids)
 
             RECORDS_TABLE = aws_dynamodb_table.records.name
         },

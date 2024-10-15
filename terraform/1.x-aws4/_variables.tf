@@ -143,28 +143,23 @@ variable "ecs_image" {
     }
 }
 
-variable "subnet_ids" {
+variable "subnets" {
     type        = list(string)
-    description = "Subnet IDs to run the task on."
+    description = "Subnet names or IDs to run the task on."
 
     validation {
-        condition     = length(var.subnet_ids) > 0
+        condition     = length(var.subnets) > 0
         error_message = "Must be a non-empty list."
-    }
-
-    validation {
-        condition     = alltrue([ for s in var.subnet_ids : can(regex("subnet-[0-9a-f]{8,17}", s)) ])
-        error_message = "Must be a list of subnet IDs."
     }
 }
 
-variable "vpc_id" {
+variable "vpc" {
     type        = string
-    description = "VPC ID that contains the subnets."
+    description = "VPC name or ID to run the task in."
 
     validation {
-        condition     = can(regex("vpc-[0-9a-f]{8,17}", var.vpc_id))
-        error_message = "Must be a VPC ID."
+        condition     = length(var.vpc) > 0
+        error_message = "Must be a non-empty string."
     }
 }
 

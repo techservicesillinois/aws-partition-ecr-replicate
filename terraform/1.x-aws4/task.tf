@@ -104,7 +104,7 @@ resource "aws_iam_role_policy" "this_worker" {
 resource "aws_security_group" "this_worker" {
     name_prefix = "${var.name}-worker-"
     description = "Security Group for the ECS Worker Task."
-    vpc_id      = var.vpc_id
+    vpc_id      = local.vpc_id
 
     egress {
         from_port        = 0
@@ -118,7 +118,6 @@ resource "aws_security_group" "this_worker" {
         Name = "${var.name}-worker"
     }
 }
-
 
 # =========================================================
 # Resources: ECS

@@ -33,6 +33,25 @@ data "aws_iam_policy_document" "assume_ecs_tasks" {
     }
 }
 
+data "aws_subnet" "main" {
+    for_each = toset([
+        for s in var.subnets : s
+        if !can(regex("^subnet-[0-9a-f]{8,17}$", s))
+    ])
+
+    tags = {
+        Name = each.key
+    }
+}
+
+data "aws_vpc" "main" {
+    count = can(regex("^vpc-[0-9a-f]{8,17}$", var.vpc)) ? 0 : 1
+
+    tags = {
+        Name = var.vpc
+    }
+}
+
 # =========================================================
 # Data: Destincation
 # =========================================================
@@ -72,6 +91,12 @@ locals {
         id     = local.account_id
         region = local.region_name
     }
+
+    subnet_ids = [
+        for s in var.subnets :
+        can(regex("^subnet-[0-9a-f]{8,17}$", s)) ? s : data.aws_subnet.main[s].id
+    ]
+    vpc_id = can(regex("^vpc-[0-9a-f]{8,17}$", var.vpc)) ? var.vpc : data.aws_vpc.main[0].id
 }
 
 # =========================================================
