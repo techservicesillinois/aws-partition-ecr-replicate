@@ -10,23 +10,29 @@ Features:
   processes events in the order they arrive to EventBridge, which may not be
   the same as the order they occurred.
 """
+from argparse import ArgumentParser
 from base64 import b64decode
 from collections import namedtuple
 import json
 import logging
+import math
 import os
-from os import path
+import sys
+from time import time
 from uuid import uuid4
 
 import boto3
+from boto3.dynamodb import conditions
 import docker
 
-RECORDS_BASE = os.environ.get('RECORDS_BASE', '/records')
-
 DST_REPO_REGION = os.environ.get('DEST_REPO_REGION')
+DST_REGISTRY_ID = os.environ.get('DEST_REGISTRY_ID')
 DST_SECRET      = os.environ.get('DEST_SECRET')
 
-IMAGES_QUEUE        = os.environ['IMAGES_QUEUE']
+SRC_REPO_REGION = os.environ.get('SRC_REPO_REGION')
+SRC_REGISTRY_ID = os.environ.get('SRC_REGISTRY_ID')
+
+IMAGES_QUEUE        = os.environ.get('IMAGES_QUEUE')
 IMAGES_TASKDEF      = os.environ.get('IMAGES_TASKDEF')
 IMAGES_TASK_CLUSTER = os.environ.get('IMAGES_TASK_CLUSTER', 'default')
 IMAGES_TASK_SUBNETS = list(filter(
@@ -37,6 +43,10 @@ IMAGES_TASK_SECURITY_GROUPS = list(filter(
     bool,
     os.environ.get('IMAGES_TASK_SECURITY_GROUPS', '').split(',')
 ))
+
+RECORDS_TABLE   = os.environ.get('RECORDS_TABLE')
+RECORDS_EXPIRES = int(os.environ.get('RECORDS_TTL', '3600'))
+RESULTS_EXPIRES = int(os.environ.get('RESULTS_TTL', '60'))
 
 LOGGING_LEVEL = getattr(
     logging,
@@ -51,6 +61,7 @@ logger.setLevel(LOGGING_LEVEL)
 
 docker_clnt = docker.from_env()
 
+ddb_rsrc = boto3.resource('dynamodb')
 ecs_clnt = boto3.client('ecs')
 sm_clnt = boto3.client('secretsmanager')
 sqs_rsrc = boto3.resource('sqs')
@@ -66,6 +77,8 @@ def get_dst_creds(secret_id=DST_SECRET):
     res = sm_clnt.get_secret_value(SecretId=secret_id)
     data = json.loads(res['SecretString'])
 
+    if not DST_REPO_REGION:
+        raise ValueError('DEST_REPO_REGION is required')
     creds = {
         'aws_access_key_id': data['accesskey'],
         'aws_secret_access_key': data['secretaccesskey'],
@@ -81,10 +94,19 @@ def login():
     Returns:
         str, str: URL of the source and destination registries.
     """
-    src_registry_url = login_registry()
+    kwargs = {}
+    if SRC_REPO_REGION:
+        kwargs['region_name'] = SRC_REPO_REGION
+    src_registry_url = login_registry(
+        registry_id=SRC_REGISTRY_ID,
+        session_kwargs=kwargs
+    )
 
     creds = get_dst_creds()
-    dst_registry_url = login_registry(session_kwargs=creds)
+    dst_registry_url = login_registry(
+        registry_id=DST_REGISTRY_ID,
+        session_kwargs=creds
+    )
 
     return src_registry_url, dst_registry_url
 
@@ -107,7 +129,7 @@ def login_registry(registry_id=None, session_kwargs=None):
     ecr_clnt = boto3.client('ecr', **session_kwargs)
 
     region_name = ecr_clnt.meta.region_name
-    if registry_id is None:
+    if not registry_id:
         sts_clnt = boto3.client('sts', **session_kwargs)
         res = sts_clnt.get_caller_identity()
         registry_id = res['Account']
@@ -141,29 +163,272 @@ def login_registry(registry_id=None, session_kwargs=None):
 
     return ECRRegistry(registry_url, ecr_clnt)
 
-def read_records(filename):
+def store_records(records):
     """
-    Read the records to process from the filename (relative to RECORDS_BASE).
-    After the file is read, successfully or not, it will be deleted.
+    Stores records from SQS into DynamoDB. This will deserialize the body
+    ahead of time, and store the record with a TTL (that should match the
+    SQS visibility setting).
 
     Args:
-        filename (str): the records file to read.
+        records (list): the records to store.
 
     Returns:
-        list: the records to process
+        str: the stored records ID.
     """
-    records_path = path.join(RECORDS_BASE, filename)
-    try:
-        with open(records_path, 'r', encoding='utf-8') as fp_records:
-            return json.load(fp_records)
-    finally:
+    item_id = str(uuid4())
+    item_records = []
+    for record in records:
         try:
-            os.remove(records_path)
+            record_body = json.loads(record['body'])
+        except json.JSONDecodeError:
+            logger.exception(
+                '[%(id)s] Unable to decode record body: %(body)s',
+                {'id': item_id, 'body': record['body']}
+            )
+            record_body = record['body']
+
+        item_records.append({
+            'MessageId': record['messageId'],
+            'ReceiptHandle': record['receiptHandle'],
+            'Body': record_body,
+        })
+
+
+    table = ddb_rsrc.Table(RECORDS_TABLE)
+    logger.debug(
+        '[%(id)s] Storing %(count)d records',
+        {'id': item_id, 'count': len(item_records)}
+    )
+    table.put_item(
+        Item={
+            'ID': item_id,
+            'Type': 'records',
+            'Records': item_records,
+            'Expires': int(time()) + RECORDS_EXPIRES,
+        },
+    )
+
+    return item_id
+
+def store_results(item_id, failure_message_ids):
+    """
+    Stores results from records into DynamoDB. This will build a Results
+    attribute that is suitable for returning from Lambda and update the
+    TTL.
+
+    Args:
+        failure_message_ids (list): the messages that failed to process.
+    """
+    results = {
+        'batchItemFailures': [ {'itemIdentifier': msg_id} for msg_id in failure_message_ids ],
+    }
+
+    table = ddb_rsrc.Table(RECORDS_TABLE)
+    logger.debug(
+        '[%(id)s] Storing %(count)d failure results',
+        {'id': item_id, 'count': len(failure_message_ids)}
+    )
+    table.put_item(
+        Item={
+            'ID': item_id,
+            'Type': 'results',
+            'Results': results,
+            'Expires': int(time()) + RESULTS_EXPIRES,
+        },
+        ConditionExpression=conditions.Attr('ID').not_exists(),
+    )
+
+def retrieve_records(item_id):
+    """
+    Retrieve records from DynamoDB.
+
+    Args:
+        item_id (str): the records ID to retrieve.
+
+    Returns:
+        list: the records stored.
+    """
+    table = ddb_rsrc.Table(RECORDS_TABLE)
+    try:
+        res = table.get_item(Key={'ID': item_id, 'Type': 'records'})
+        if 'Item' not in res:
+            logger.warning(
+                '[%(id)s] No records found',
+                {'id': item_id}
+            )
+            return []
+
+        return res['Item']['Records']
+    finally:
+        logger.debug(
+            '[%(id)s] Deleting records item',
+            {'id': item_id}
+        )
+        try:
+            table.delete_item(Key={'Id': item_id, 'Type': 'records'})
         except Exception: # pylint: disable=broad-except
             logger.exception(
-                'Unable to remove records file: %(path)s',
-                {'path': records_path}
+                '[%(id)s] Unable to delete records',
+                {'id': item_id}
             )
+
+def retrieve_results(item_id):
+    """
+    Retrieve results from DynamoDB. This will delete the results after they
+    have been retrieved.
+
+    Args:
+        item_id (str): the records ID to retrieve.
+
+    Returns:
+        list: the results stored.
+    """
+    table = ddb_rsrc.Table(RECORDS_TABLE)
+    try:
+        res = table.get_item(Key={'ID': item_id, 'Type': 'results'})
+        if 'Item' not in res:
+            logger.warning(
+                '[%(id)s] No results found',
+                {'id': item_id}
+            )
+            return {'batchItemFailures': []}
+
+        return res['Item']['Results']
+    finally:
+        logger.debug(
+            '[%(id)s] Deleting results item',
+            {'id': item_id}
+        )
+        try:
+            table.delete_item(Key={'Id': item_id, 'Type': 'results'})
+        except Exception: # pylint: disable=broad-except
+            logger.exception(
+                '[%(id)s] Unable to delete results',
+                {'id': item_id}
+            )
+
+def task_start(records_id, context, _logger):
+    """
+    Start the ECS Task to replicate the images. Does not return until the task
+    has reached the running state.
+
+    Args:
+        records_id (str): the records ID to process.
+        context (obj): the Lambda context object.
+        _logger (obj): the logger to use.
+
+    Returns:
+        str: the task ARN that was started.
+    """
+    _logger.debug(
+        'Running task %(taskdef)s',
+        {'taskdef': IMAGES_TASKDEF}
+    )
+    res = ecs_clnt.run_task(
+        cluster=IMAGES_TASK_CLUSTER,
+        task_definition=IMAGES_TASKDEF,
+        count=1,
+        launchType='FARGATE',
+        networkConfiguration={
+            'awsvpcConfiguration': {
+                'subnets': IMAGES_TASK_SUBNETS,
+                'securityGroups': IMAGES_TASK_SECURITY_GROUPS,
+                'assignPublicIp': 'DISABLED',
+            }
+        },
+        overrides={
+            'containerOverrides': [
+                {
+                    'name': 'replicate',
+                    'command': [ records_id ],
+                },
+            ],
+        },
+        startedBy=f"lambda:{context.function_name}",
+    )
+
+    if not res['tasks']:
+        raise RuntimeError('No tasks started')
+    task_arn = res['tasks'][0]['taskArn']
+    _logger.info(
+        'Started task %(task_arn)s',
+        {'task_arn': task_arn}
+    )
+
+    wait_for_task(task_arn, 'running', context, _logger)
+    return task_arn
+
+def task_join(task_arn, context, _logger):
+    """
+    Wait for a task to reach a state, and check that the first container exited
+    successfully. If the task did not exit cleanly then raise an exception.
+
+    Args:
+        task_arn (str): the task ARN to wait for.
+        context (obj): the Lambda context object.
+        _logger (obj): the logger to use.
+    """
+    task = wait_for_task(task_arn, 'stopped', context, _logger)
+    if not task['containers']:
+        raise RuntimeError('No containers found')
+    container = task['containers'][0]
+
+    if task['stopCode'] != 'EssentialContainerExited' or container['exitCode'] != 0:
+        _logger.error(
+            'Task failed (%(task_arn)s): %(stop_code)s - exit code %(exit_code)d',
+            {
+                'task_arn': task_arn,
+                'stop_code': task['stopCode'],
+                'exit_code': container['exitCode'],
+            }
+        )
+        raise RuntimeError(
+            f"Task did not exit cleanly: {task['stopCode']} (exit code: {container['exitCode']})"
+        )
+
+def wait_for_task(task_arn, state, context, _logger):
+    """
+    Wait for a task to reach a state, and check that the first container exited
+    successfully. If the task did not exit cleanly then raise an exception.
+
+    Args:
+        task_arn (str): the task ARN to wait for.
+        context (obj): the Lambda context object.
+        _logger (obj): the logger to use.
+
+    Returns:
+        dict: the task object from DescribeTasks.
+    """
+    # Wait the remaining time for the task to complete, minus 5 seconds for
+    # us to successfully shutdown.
+    max_attempts = math.floor(
+        (context.get_remaining_time_in_millis() - 5000) / 1000 / 10
+    )
+    if max_attempts < 1:
+        raise ValueError('Not enough time to wait for task')
+
+    _logger.debug(
+        'Waiting for task %(task_arn)s to %(state)s (max_attempts=%(max_attempts)d)',
+        {'task_arn': task_arn, 'state': state, 'max_attempts': max_attempts}
+    )
+    waiter = ecs_clnt.get_waiter(f"tasks_{state}")
+    waiter.wait(
+        cluster=IMAGES_TASK_CLUSTER,
+        tasks=[task_arn],
+        WaiterConfig={
+            'Delay': 10,
+            'MaxAttempts': max_attempts,
+        }
+    )
+
+    res = ecs_clnt.describe_tasks(
+        cluster=IMAGES_TASK_CLUSTER,
+        tasks=[task_arn],
+    )
+    if not res['tasks']:
+        raise RuntimeError('No tasks found')
+    return res['tasks'][0]
+
 
 class ECRImage:
     """
@@ -292,6 +557,9 @@ def event_handler(event, context):
         context (obj): Lambda context.
     """
     # pylint: disable=unused-argument
+    if not IMAGES_QUEUE:
+        raise ValueError('IMAGES_QUEUE is required')
+
     detail      = event['detail']
 
     repo_name    = detail['repository-name']
@@ -333,6 +601,8 @@ def queue_handler(event, context):
         context (obj): Lambda context.
     """
     # pylint: disable=unused-argument
+    if not IMAGES_QUEUE:
+        raise ValueError('IMAGES_QUEUE is required')
     if not IMAGES_TASKDEF:
         raise ValueError('IMAGES_TASKDEF is required')
     if not IMAGES_TASK_CLUSTER:
@@ -341,104 +611,59 @@ def queue_handler(event, context):
         raise ValueError('IMAGES_TASK_SECURITY_GROUPS is required')
     if not IMAGES_TASK_SUBNETS:
         raise ValueError('IMAGES_TASK_SUBNETS is required')
+    if not RECORDS_TABLE:
+        raise ValueError('RECORDS_TABLE is required')
 
-    records_id = str(uuid4())
+    records_id = store_records(event['Records'])
     rec_logger = logger.getChild(f"Records({records_id})")
 
-    records_path = path.join(RECORDS_BASE, f"{records_id}.json")
-    rec_logger.debug(
-        'Writing record to json file: %(path)s',
-        {'path': records_path}
-    )
-    with open(records_path, 'w', encoding='utf-8') as fp_records:
-        json.dump(event['Records'], fp=fp_records)
+    task_arn = task_start(records_id, context, rec_logger)
+    task_join(task_arn, context, rec_logger)
 
-    rec_logger.debug(
-        'Running task %(taskdef)s',
-        {'taskdef': IMAGES_TASKDEF}
-    )
-    res = ecs_clnt.run_task(
-        cluster=IMAGES_TASK_CLUSTER,
-        task_definition=IMAGES_TASKDEF,
-        count=1,
-        launchType='FARGATE',
-        networkConfiguration={
-            'awsvpcConfiguration': {
-                'subnets': IMAGES_TASK_SUBNETS,
-                'securityGroups': IMAGES_TASK_SECURITY_GROUPS,
-                'assignPublicIp': 'DISABLED',
-            }
-        },
-        overrides={
-            'containerOverrides': [
-                {
-                    'name': 'replicate',
-                    'command': [ f"{records_id}.json" ],
-                },
-            ],
-        },
-        startedBy=f"lambda:{context.function_name}",
-    )
+    return retrieve_results(records_id)
 
-    for task in res['tasks']:
-        rec_logger.info(
-            'Started task %(task_arn)s',
-            {'task_arn': task['taskArn']}
-        )
-
-def main(filename):
+def main(records_id):
     """
-    Process the records in the file, replicating the image PUSH and DELETE
-    actions. This will delete the file after it has been read, but before we
-    know if processing was successful. If there was an error in processing then
-    the SQS Queue will handle the retry. Successfully processed records will
-    be deleted from the queue.
+    Process the records in dynamodb, replicating the image PUSH and DELETE
+    actions. This will delete the DynamoDB item after it has been read, but
+    before we know if processing was successful. If there was an error in
+    processing then the SQS Queue will handle the retry. Successfully processed
+    records will be deleted from the queue.
 
     Args:
-        filename (str): records file to process.
+        records_id (str): records item to process.
     """
     if not DST_REPO_REGION:
         raise ValueError('DEST_REPO_REGION is required')
     if not DST_SECRET:
         raise ValueError('DEST_SECRET is required')
-    if not filename:
-        raise ValueError('filename is required')
+    if not RECORDS_TABLE:
+        raise ValueError('RECORDS_TABLE is required')
+
+    if not records_id:
+        raise ValueError('records_id is required')
+
+    failure_message_ids = []
+    def _failure(_record):
+        failure_message_ids.append(_record['MessageId'])
 
     src_registry, dst_registry = login()
 
-    records = read_records(filename)
-    message_successes = []
-    def _success(_record):
-        message_successes.append(
-            {
-                'Id': _record['MessageId'],
-                'ReceiptHandle': _record['ReceiptHandle'],
-            }
-        )
-
     images = {}
-    for record in records:
+    for record in retrieve_records(records_id):
         # There errors are not ones we can retry, so we log and continue.
         try:
-            detail = json.loads(record['body'])
+            detail = record['Body']
 
             repo_name    = detail['repository-name']
             image_digest = detail['image-digest']
             image_tag    = detail.get('image-tag')
             action_type  = detail['action-type']
-        except json.JSONDecodeError:
-            logger.exception(
-                'Unable to decode record body: %(body)s',
-                {'body': record['body']}
-            )
-            _success(record)
-            continue
         except KeyError:
             logger.exception(
                 'Missing field in record: %(record)r',
                 {'record': record}
             )
-            _success(record)
             continue
 
         try:
@@ -462,9 +687,36 @@ def main(filename):
                 'Error processing record: %(record)r',
                 {'record': record}
             )
-        else:
-            _success(record)
+            _failure(record)
 
-    if message_successes:
-        queue = sqs_rsrc.Queue(IMAGES_QUEUE)
-        queue.delete_messages(Entries=message_successes)
+    store_results(records_id, failure_message_ids)
+
+def parse_args():
+    """
+    Parse the command line arguments.
+    """
+
+    parser = ArgumentParser(description='Partition ECR Replication')
+    parser.add_argument(
+        '--debug', '-d',
+        action='store_true',
+        default=(LOGGING_LEVEL == logging.DEBUG),
+        help='Enable debug logging',
+    )
+    parser.add_argument(
+        'records_id',
+        help='DynamoDB records item to process',
+    )
+
+    return parser.parse_args()
+
+if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+    )
+    args = parse_args()
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+
+    main(args.records_id)
