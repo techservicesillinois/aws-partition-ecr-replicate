@@ -1,0 +1,13 @@
+.venv/
+build/
+dist/
+scripts/
+terraform/
+tests/
+
+.gitignore
+.pylintrc
+CODEOWNERS
+LICENSE.md
+README.md
+Makefile
