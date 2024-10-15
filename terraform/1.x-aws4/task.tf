@@ -145,22 +145,21 @@ resource "aws_ecs_task_definition" "this_worker" {
     network_mode             = "awsvpc"
     container_definitions    = jsonencode([
         {
-            name       = "replicate"
-            image      = local.ecs_image_url
-            essential  = true
-            privileged = true
+            name      = "replicate"
+            image     = local.ecs_image_url
+            essential = true
 
             environment = [
-                { key = "AWS_REGION", value = local.region_name },
-                { key = "AWS_DEFAULT_REGION", value = local.region_name },
-                { key = "RECORDS_TABLE", value = aws_dynamodb_table.records.name },
+                { name = "AWS_REGION", value = local.region_name },
+                { name = "AWS_DEFAULT_REGION", value = local.region_name },
+                { name = "RECORDS_TABLE", value = aws_dynamodb_table.records.name },
 
-                { key = "DEST_REPO_REGION", value = local.destination_registry.region },
-                { key = "DEST_REGISTRY_ID", value = local.destination_registry.id },
-                { key = "DEST_SECRET", value = aws_secretsmanager_secret.dest_credentials.arn },
+                { name = "DEST_REPO_REGION", value = local.destination_registry.region },
+                { name = "DEST_REGISTRY_ID", value = local.destination_registry.id },
+                { name = "DEST_SECRET", value = aws_secretsmanager_secret.dest_credentials.arn },
 
-                { key = "SRC_REPO_REGION", value = local.source_registry.region },
-                { key = "SRC_REGISTRY_ID", value = local.source_registry.id },
+                { name = "SRC_REPO_REGION", value = local.source_registry.region },
+                { name = "SRC_REGISTRY_ID", value = local.source_registry.id },
             ]
 
             logConfiguration = {
