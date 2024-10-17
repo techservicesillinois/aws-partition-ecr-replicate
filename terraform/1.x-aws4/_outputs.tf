@@ -13,11 +13,11 @@ output "lambda_queue" {
     value = module.this_queue
 }
 
-output "task_worker" {
-    value = aws_ecs_task_definition.this_worker
+output "project_worker" {
+    value = aws_codebuild_project.this_worker
 }
 
-output "task_worker_role" {
+output "worker_role" {
     value = {
         arn       = aws_iam_role.this_worker.arn
         name      = aws_iam_role.this_worker.name

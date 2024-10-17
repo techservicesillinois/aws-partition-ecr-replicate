@@ -8,7 +8,7 @@ data "aws_region" "current" {}
 
 data "aws_caller_identity" "current" {}
 
-data "aws_iam_policy_document" "assume_ecs_tasks" {
+data "aws_iam_policy_document" "assume_codebuild" {
     statement {
         effect = "Allow"
 
@@ -16,13 +16,13 @@ data "aws_iam_policy_document" "assume_ecs_tasks" {
 
         principals {
             type        = "Service"
-            identifiers = [ "ecs-tasks.amazonaws.com" ]
+            identifiers = [ "codebuild.amazonaws.com" ]
         }
 
         condition {
             test     = "ArnLike"
             variable = "aws:SourceArn"
-            values   = [ "arn:${local.partition}:ecs:${local.region_name}:${local.account_id}:*" ]
+            values   = [ "arn:${local.partition}:codebuild:${local.region_name}:${local.account_id}:project/*" ]
         }
 
         condition {
@@ -30,25 +30,6 @@ data "aws_iam_policy_document" "assume_ecs_tasks" {
             variable = "aws:SourceAccount"
             values   = [ local.account_id ]
         }
-    }
-}
-
-data "aws_subnet" "main" {
-    for_each = toset([
-        for s in var.subnets : s
-        if !can(regex("^subnet-[0-9a-f]{8,17}$", s))
-    ])
-
-    tags = {
-        Name = each.key
-    }
-}
-
-data "aws_vpc" "main" {
-    count = can(regex("^vpc-[0-9a-f]{8,17}$", var.vpc)) ? 0 : 1
-
-    tags = {
-        Name = var.vpc
     }
 }
 
@@ -91,12 +72,6 @@ locals {
         id     = local.account_id
         region = local.region_name
     }
-
-    subnet_ids = [
-        for s in var.subnets :
-        can(regex("^subnet-[0-9a-f]{8,17}$", s)) ? s : data.aws_subnet.main[s].id
-    ]
-    vpc_id = can(regex("^vpc-[0-9a-f]{8,17}$", var.vpc)) ? var.vpc : data.aws_vpc.main[0].id
 }
 
 # =========================================================
@@ -104,16 +79,16 @@ locals {
 # =========================================================
 
 locals {
-    ecs_image = var.ecs_image == null ? {
+    worker_image = var.worker_image == null ? {
         prefix      = ""
         registry_id = local.account_id
         latest      = false
     } : {
-        prefix      = var.ecs_image.prefix
-        registry_id = coalesce(var.ecs_image.registry_id, local.account_id)
-        latest      = var.ecs_image.latest
+        prefix      = var.worker_image.prefix
+        registry_id = coalesce(var.worker_image.registry_id, local.account_id)
+        latest      = var.worker_image.latest
     }
-    ecs_image_url = "${local.ecs_image.registry_id}.dkr.ecr.${local.region_name}.amazonaws.com/${local.ecs_image.prefix}partition-ecr-replicate:${local.ecs_image.latest ? "latest" : var.environment}"
+    worker_image_url = "${local.worker_image.registry_id}.dkr.ecr.${local.region_name}.amazonaws.com/${local.worker_image.prefix}partition-ecr-replicate:${local.worker_image.latest ? "latest" : var.environment}"
 }
 
 data "aws_s3_object" "this" {
@@ -125,7 +100,7 @@ data "aws_s3_object" "this" {
 
 # We don't actually use this, it is just to check that the image exists
 data "aws_ecr_image" "this" {
-    registry_id     = local.ecs_image.registry_id
-    repository_name = "${local.ecs_image.prefix}partition-ecr-replicate"
-    image_tag       = local.ecs_image.latest ? "latest" : var.environment
+    registry_id     = local.worker_image.registry_id
+    repository_name = "${local.worker_image.prefix}partition-ecr-replicate"
+    image_tag       = local.worker_image.latest ? "latest" : var.environment
 }

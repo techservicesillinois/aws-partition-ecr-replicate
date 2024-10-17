@@ -117,18 +117,13 @@ variable "notifications_topic_arn" {
 # ECS
 # =========================================================
 
-variable "ecs_cluster_name" {
+variable "worker_compute_type" {
     type        = string
-    description = "Name of the ECS Cluster to run the task."
-    default     = "default"
-
-    validation {
-        condition     = length(var.ecs_cluster_name) > 0
-        error_message = "Must be a non-empty string."
-    }
+    description = "Compute type for the CodeBuild Project."
+    default     = "BUILD_GENERAL1_SMALL"
 }
 
-variable "ecs_image" {
+variable "worker_image" {
     type        = object({
                     prefix      = optional(string, "")
                     registry_id = optional(string)
@@ -138,41 +133,9 @@ variable "ecs_image" {
     default     = null
 
     validation {
-        condition     = var.ecs_image == null ? true : can(regex("^(.+/)?$", var.ecs_image.prefix))
+        condition     = var.worker_image == null ? true : can(regex("^(.+/)?$", var.worker_image.prefix))
         error_message = "Prefix must be empty or end with a '/'."
     }
-}
-
-variable "subnets" {
-    type        = list(string)
-    description = "Subnet names or IDs to run the task on."
-
-    validation {
-        condition     = length(var.subnets) > 0
-        error_message = "Must be a non-empty list."
-    }
-}
-
-variable "vpc" {
-    type        = string
-    description = "VPC name or ID to run the task in."
-
-    validation {
-        condition     = length(var.vpc) > 0
-        error_message = "Must be a non-empty string."
-    }
-}
-
-variable "worker_cpu" {
-    type        = number
-    description = "CPU units to allocate to the worker task."
-    default     = 512
-}
-
-variable "worker_memory" {
-    type        = number
-    description = "Memory in MiB to allocate to the worker task."
-    default     = 1024
 }
 
 variable "worker_log_group_name" {

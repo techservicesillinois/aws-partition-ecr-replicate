@@ -17,7 +17,28 @@ data "aws_iam_policy_document" "this_queue" {
     }
 
     statement {
-        sid = "DynamoDB"
+        sid    = "CodeBuildPassRole"
+        effect = "Allow"
+
+        actions = [
+            "iam:PassRole",
+        ]
+        resources = [ aws_iam_role.this_worker.arn ]
+    }
+
+    statement {
+        sid    = "CodeBuild"
+        effect = "Allow"
+
+        actions = [
+            "codebuild:BatchGetBuilds",
+            "codebuild:StartBuild",
+        ]
+        resources = [ aws_codebuild_project.this_worker.arn ]
+    }
+
+    statement {
+        sid    = "DynamoDB"
         effect = "Allow"
 
         actions = [
@@ -55,11 +76,8 @@ module "this_queue" {
         {
             LOGGING_LEVEL = local.partition == "aws" || local.is_debug ? "DEBUG" : "INFO"
 
-            IMAGES_QUEUE                = aws_sqs_queue.images.url
-            IMAGES_TASKDEF              = aws_ecs_task_definition.this_worker.arn
-            IMAGES_TASK_CLUSTER         = var.ecs_cluster_name
-            IMAGES_TASK_SECURITY_GROUPS = aws_security_group.this_worker.id
-            IMAGES_TASK_SUBNETS         = join(",", local.subnet_ids)
+            IMAGES_QUEUE   = aws_sqs_queue.images.url
+            IMAGES_PROJECT = aws_codebuild_project.this_worker.name
 
             RECORDS_TABLE = aws_dynamodb_table.records.name
         },

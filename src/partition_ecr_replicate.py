@@ -13,9 +13,9 @@ Features:
 from argparse import ArgumentParser
 from base64 import b64decode
 from collections import namedtuple
+import enum
 import json
 import logging
-import math
 import os
 import sys
 from time import time
@@ -33,17 +33,8 @@ DST_SECRET      = os.environ.get('DEST_SECRET')
 SRC_REPO_REGION = os.environ.get('SRC_REPO_REGION')
 SRC_REGISTRY_ID = os.environ.get('SRC_REGISTRY_ID')
 
-IMAGES_QUEUE        = os.environ.get('IMAGES_QUEUE')
-IMAGES_TASKDEF      = os.environ.get('IMAGES_TASKDEF')
-IMAGES_TASK_CLUSTER = os.environ.get('IMAGES_TASK_CLUSTER', 'default')
-IMAGES_TASK_SUBNETS = list(filter(
-    bool,
-    os.environ.get('IMAGES_TASK_SUBNETS', '').split(',')
-))
-IMAGES_TASK_SECURITY_GROUPS = list(filter(
-    bool,
-    os.environ.get('IMAGES_TASK_SECURITY_GROUPS', '').split(',')
-))
+IMAGES_QUEUE   = os.environ.get('IMAGES_QUEUE')
+IMAGES_PROJECT = os.environ.get('IMAGES_PROJECT')
 
 RECORDS_TABLE   = os.environ.get('RECORDS_TABLE')
 RECORDS_EXPIRES = int(os.environ.get('RECORDS_TTL', '3600'))
@@ -56,6 +47,22 @@ LOGGING_LEVEL = getattr(
 )
 
 ECRRegistry = namedtuple('ECRRegistry', ['url', 'clnt'])
+class BuildPhase(enum.IntEnum):
+    """
+    Build phases for a project. These are done in order so that we can compare
+    then and see if the current phase has already passed.
+    """
+    SUBMITTED        = enum.auto()
+    QUEUED           = enum.auto()
+    PROVISIONING     = enum.auto()
+    DOWNLOAD_SOURCE  = enum.auto()
+    INSTALL          = enum.auto()
+    PRE_BUILD        = enum.auto()
+    BUILD            = enum.auto()
+    POST_BUILD       = enum.auto()
+    UPLOAD_ARTIFACTS = enum.auto()
+    FINALIZING       = enum.auto()
+    COMPLETED        = enum.auto()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(LOGGING_LEVEL)
@@ -67,7 +74,7 @@ except DockerException:
     docker_clnt = None
 
 ddb_rsrc = boto3.resource('dynamodb')
-ecs_clnt = boto3.client('ecs')
+codebuild_clnt = boto3.client('codebuild')
 sm_clnt = boto3.client('secretsmanager')
 sqs_rsrc = boto3.resource('sqs')
 
@@ -312,10 +319,10 @@ def retrieve_results(item_id):
                 {'id': item_id}
             )
 
-def task_start(records_id, context, _logger):
+def build_start(records_id, /, context, _logger):
     """
-    Start the ECS Task to replicate the images. Does not return until the task
-    has reached the running state.
+    Start the CodeBuild Project to replicate the images. Does not return until
+    the build has reached the BUILD phase.
 
     Args:
         records_id (str): the records ID to process.
@@ -323,117 +330,121 @@ def task_start(records_id, context, _logger):
         _logger (obj): the logger to use.
 
     Returns:
-        str: the task ARN that was started.
+        str: the build ID that was started.
     """
     _logger.debug(
-        'Running task %(taskdef)s',
-        {'taskdef': IMAGES_TASKDEF}
+        'Running project %(project)s',
+        {'project': IMAGES_PROJECT}
     )
-    res = ecs_clnt.run_task(
-        cluster=IMAGES_TASK_CLUSTER,
-        taskDefinition=IMAGES_TASKDEF,
-        count=1,
-        launchType='FARGATE',
-        networkConfiguration={
-            'awsvpcConfiguration': {
-                'subnets': IMAGES_TASK_SUBNETS,
-                'securityGroups': IMAGES_TASK_SECURITY_GROUPS,
-                'assignPublicIp': 'DISABLED',
-            }
-        },
-        overrides={
-            'containerOverrides': [
-                {
-                    'name': 'replicate',
-                    'command': [ records_id ],
-                },
-            ],
-        },
-        startedBy=f"lambda:{context.function_name}",
-    )
-
-    if not res['tasks']:
-        raise RuntimeError('No tasks started')
-    task_arn = res['tasks'][0]['taskArn']
-    _logger.info(
-        'Started task %(task_arn)s',
-        {'task_arn': task_arn}
-    )
-
-    wait_for_task(task_arn, 'running', context, _logger)
-    return task_arn
-
-def task_join(task_arn, context, _logger):
-    """
-    Wait for a task to reach a state, and check that the first container exited
-    successfully. If the task did not exit cleanly then raise an exception.
-
-    Args:
-        task_arn (str): the task ARN to wait for.
-        context (obj): the Lambda context object.
-        _logger (obj): the logger to use.
-    """
-    task = wait_for_task(task_arn, 'stopped', context, _logger)
-    if not task['containers']:
-        raise RuntimeError('No containers found')
-    container = task['containers'][0]
-
-    if task['stopCode'] != 'EssentialContainerExited' or container['exitCode'] != 0:
-        _logger.error(
-            'Task failed (%(task_arn)s): %(stop_code)s - exit code %(exit_code)d',
+    res = codebuild_clnt.start_build(
+        projectName=IMAGES_PROJECT,
+        environmentVariablesOverride=[
             {
-                'task_arn': task_arn,
-                'stop_code': task['stopCode'],
-                'exit_code': container['exitCode'],
+                'type': 'PLAINTEXT',
+                'name': 'RECORDS_ID',
+                'value': records_id,
+            },
+        ],
+    )
+
+    if not res['build']:
+        raise RuntimeError('No build started')
+    build_id = res['build']['id']
+    _logger.info(
+        'Started build %(build_id)s',
+        {'build_id': build_id}
+    )
+
+    build = wait_for_build(build_id, BuildPhase.PRE_BUILD, context=context, _logger=_logger)
+    if build['buildStatus'] not in {'SUCCEEDED', 'IN_PROGRESS'}:
+        _logger.error(
+            'Build failed (%(build_id)s): %(build_phase)s = %(build_status)s',
+            {
+                'build_id': build_id,
+                'build_phase': build['currentPhase'],
+                'build_status': build['buildStatus'],
             }
         )
         raise RuntimeError(
-            f"Task did not exit cleanly: {task['stopCode']} (exit code: {container['exitCode']})"
+            f"Build failed: {build['currentPhase']} = {build['buildStatus']}"
         )
+    return build_id
 
-def wait_for_task(task_arn, state, context, _logger):
+def build_join(build_id, /, context, _logger):
     """
-    Wait for a task to reach a state, and check that the first container exited
-    successfully. If the task did not exit cleanly then raise an exception.
+    Wait for a build to reach a phase, and check that the phase was successful.
+    If the build was not successful then raise an exception.
 
     Args:
-        task_arn (str): the task ARN to wait for.
+        build_id (str): the build ID to wait for.
+        context (obj): the Lambda context object.
+        _logger (obj): the logger to use.
+    """
+    build = wait_for_build(build_id, BuildPhase.COMPLETED, context=context, _logger=_logger)
+    if build['buildStatus'] != 'SUCCEEDED':
+        _logger.error(
+            'Build failed (%(build_id)s): %(build_phase)s = %(build_status)s',
+            {
+                'build_id': build_id,
+                'build_phase': build['currentPhase'],
+                'build_status': build['buildStatus'],
+            }
+        )
+        raise RuntimeError(
+            f"Build failed: {build['currentPhase']} = {build['buildStatus']}"
+        )
+
+def wait_for_build(build_id, phase, /, context, _logger):
+    """
+    Wait for a build to reach a phase, and check that the phase has finished.
+    This does not raise an error if the phase finished unsuccessfully.
+
+    Args:
+        build_id (str): the build ID to wait for.
+        phase (BuildPhase): the phase to wait for.
         context (obj): the Lambda context object.
         _logger (obj): the logger to use.
 
     Returns:
-        dict: the task object from DescribeTasks.
+        dict: the build object from BatchGetBuilds.
     """
-    # Wait the remaining time for the task to complete, minus 5 seconds for
-    # us to successfully shutdown.
-    max_attempts = math.floor(
-        (context.get_remaining_time_in_millis() - 5000) / 1000 / 10
-    )
-    if max_attempts < 1:
-        raise ValueError('Not enough time to wait for task')
-
     _logger.debug(
-        'Waiting for task %(task_arn)s to %(state)s (max_attempts=%(max_attempts)d)',
-        {'task_arn': task_arn, 'state': state, 'max_attempts': max_attempts}
+        'Waiting for build %(build_id)s to %(phase)s',
+        {'build_id': build_id, 'phase': phase.name}
     )
-    waiter = ecs_clnt.get_waiter(f"tasks_{state}")
-    waiter.wait(
-        cluster=IMAGES_TASK_CLUSTER,
-        tasks=[task_arn],
-        WaiterConfig={
-            'Delay': 10,
-            'MaxAttempts': max_attempts,
-        }
-    )
+    while context.get_remaining_time_in_millis() > 5000:
+        res = codebuild_clnt.batch_get_builds(ids=[build_id])
+        if not res['builds']:
+            raise RuntimeError('No builds found')
+        build = res['builds'][0]
+        build_status = build['buildStatus']
+        build_phase = BuildPhase[build['currentPhase']]
 
-    res = ecs_clnt.describe_tasks(
-        cluster=IMAGES_TASK_CLUSTER,
-        tasks=[task_arn],
-    )
-    if not res['tasks']:
-        raise RuntimeError('No tasks found')
-    return res['tasks'][0]
+        if build_status not in {'SUCCEEDED', 'IN_PROGRESS'}:
+            _logger.error(
+                'Build failed (%(build_id)s): %(phase)s = %(status)s',
+                {'build_id': build_id, 'phase': build_phase.name, 'status': build_status}
+            )
+            return build
+        if build_phase == phase:
+            if build_status != 'IN_PROGRESS':
+                _logger.info(
+                    'Build %(build_id)s reached %(phase)s: %(status)s',
+                    {'build_id': build_id, 'phase': build_phase, 'status': build_status}
+                )
+                return build
+        elif build_phase > phase:
+            _logger.info(
+                'Build %(build_id)s passed %(phase)s successfully: %(build_phase)s',
+                {'build_id': build_id, 'phase': phase.name, 'build_phase': build_phase.name}
+            )
+            return build
 
+        if context.get_remaining_time_in_millis() <= 10000:
+            break
+        time.sleep(10)
+
+    raise ValueError('Not enough time to wait for build')
 
 class ECRImage:
     """
@@ -599,7 +610,7 @@ def event_handler(event, context):
 def queue_handler(event, context):
     """
     Take records from the SQS FIFO Queue for objects, place them in a temporary
-    file, and start the ECS Task.
+    file, and start the CodeBuild Project.
 
     Args:
         event (dict): SQS records of events.
@@ -608,22 +619,16 @@ def queue_handler(event, context):
     # pylint: disable=unused-argument
     if not IMAGES_QUEUE:
         raise ValueError('IMAGES_QUEUE is required')
-    if not IMAGES_TASKDEF:
-        raise ValueError('IMAGES_TASKDEF is required')
-    if not IMAGES_TASK_CLUSTER:
-        raise ValueError('IMAGES_TASK_CLUSTER is required')
-    if not IMAGES_TASK_SECURITY_GROUPS:
-        raise ValueError('IMAGES_TASK_SECURITY_GROUPS is required')
-    if not IMAGES_TASK_SUBNETS:
-        raise ValueError('IMAGES_TASK_SUBNETS is required')
+    if not IMAGES_PROJECT:
+        raise ValueError('IMAGES_PROJECT is required')
     if not RECORDS_TABLE:
         raise ValueError('RECORDS_TABLE is required')
 
     records_id = store_records(event['Records'])
     rec_logger = logger.getChild(f"Records({records_id})")
 
-    task_arn = task_start(records_id, context, rec_logger)
-    task_join(task_arn, context, rec_logger)
+    build_id = build_start(records_id, context=context, _logger=rec_logger)
+    build_join(build_id, context=context, _logger=rec_logger)
 
     return retrieve_results(records_id)
 
