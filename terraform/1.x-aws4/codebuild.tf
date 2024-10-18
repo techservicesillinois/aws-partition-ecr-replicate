@@ -11,7 +11,10 @@ data "aws_iam_policy_document" "this_worker" {
             "logs:CreateLogStream",
             "logs:PutLogEvents",
         ]
-        resources = [ aws_cloudwatch_log_group.this_worker.arn ]
+        resources = [
+            aws_cloudwatch_log_group.this_worker.arn,
+            "${aws_cloudwatch_log_group.this_worker.arn}:*",
+        ]
     }
 
     statement {
@@ -37,12 +40,17 @@ data "aws_iam_policy_document" "this_worker" {
             "ecr:GetDownloadUrlForLayer",
         ]
 
-        resources = length(var.source_prefixes) > 0 ? [
-            for p in var.source_prefixes :
-            "arn:${local.partition}:ecr:${local.source_registry.region}:${local.source_registry.id}:repository/${p}*"
-        ] : [
-            "arn:${local.partition}:ecr:${local.source_registry.region}:${local.source_registry.id}:repository/*",
-        ]
+        resources = concat(
+            [
+                "arn:${local.partition}:ecr:${local.region_name}:${local.worker_image.registry_id}:repository/${local.worker_image.prefix}partition-ecr-replicate",
+            ],
+            length(var.source_prefixes) > 0 ? [
+                for p in var.source_prefixes :
+                "arn:${local.partition}:ecr:${local.source_registry.region}:${local.source_registry.id}:repository/${p}*"
+            ] : [
+                "arn:${local.partition}:ecr:${local.source_registry.region}:${local.source_registry.id}:repository/*",
+            ]
+        )
     }
 
     statement {
@@ -107,7 +115,8 @@ resource "aws_codebuild_project" "this_worker" {
     description  = "CodeBuild Project to replicate ECR Images between registries in different partitions."
     service_role = aws_iam_role.this_worker.arn
 
-    build_timeout = 15
+    build_timeout          = 15
+    concurrent_build_limit = 10
 
     source {
         type      = "NO_SOURCE"
@@ -119,10 +128,11 @@ resource "aws_codebuild_project" "this_worker" {
     }
 
     environment {
-        image           = local.worker_image_url
-        type            = "LINUX_CONTAINER"
-        compute_type    = var.worker_compute_type
-        privileged_mode = true
+        image                       = local.worker_image_url
+        image_pull_credentials_type = "SERVICE_ROLE"
+        type                        = "LINUX_CONTAINER"
+        compute_type                = var.worker_compute_type
+        privileged_mode             = true
 
         dynamic "environment_variable" {
             for_each = {
