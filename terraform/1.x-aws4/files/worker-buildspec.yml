@@ -2,8 +2,12 @@ version: 0.2
 env:
   shell: bash
 phases:
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - /app/start-dockerd.sh
   build:
     on-failure: ABORT
     commands:
       - 'cd /app'
-      - 'python3.11 partition_ecr_replicate.py ${RECORD_ID}'
+      - 'python3.11 partition_ecr_replicate.py ${RECORDS_ID}'

@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         gpg-agent \
         software-properties-common \
+        docker.io \
     && add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update && apt-get install -y --no-install-recommends \
         python3.11 \
@@ -21,5 +22,9 @@ RUN python3.11 -m pip install -r /tmp/requirements.txt \
 # Copy function code
 COPY src/ /app
 
+COPY entrypoint.sh entrypoint.sh
+COPY start-dockerd.sh start-dockerd.sh
+RUN chmod a+rx entrypoint.sh start-dockerd.sh
+
 # Set the CMD to your handler (could also be done as a parameter override outside of the Dockerfile)
-ENTRYPOINT [ "python3.11", "partition_ecr_replicate.py" ]
+ENTRYPOINT [ "/app/entrypoint.sh" ]
