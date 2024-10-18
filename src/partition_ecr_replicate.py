@@ -462,15 +462,18 @@ class ECRImage:
         self._dst_registry = dst_registry
         self._dst_repo = f"{dst_registry.url}/{repo_name}"
 
-        self._logger.debug(
-            'Pulling image from %(registry_url)s',
-            {'registry_url': self._src_registry.url}
-        )
-        self._image = docker_clnt.images.pull(self._src_repo, image_digest)
+        self._image = None
 
     @property
     def image(self):
         """ Docker API image. """
+        if self._image is None:
+            self._logger.debug(
+                'Pulling image from %(registry_url)s',
+                {'registry_url': self._src_registry.url}
+            )
+            self._image = docker_clnt.images.pull(self._src_repo, self._image_digest)
+
         return self._image
 
     @property
@@ -537,7 +540,7 @@ class ECRImage:
             'Tagging image with %(dst_repo)s:%(tag)s',
             {'dst_repo': self._dst_repo, 'tag': image_tag}
         )
-        self._image.tag(self._dst_repo, tag=image_tag)
+        self.image.tag(self._dst_repo, tag=image_tag)
 
         self._logger.info(
             'Pushing image to %(registry_url)s',
