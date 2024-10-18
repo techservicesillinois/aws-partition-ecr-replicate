@@ -22,6 +22,7 @@ data "aws_iam_policy_document" "replicate_user" {
         actions = [
             "ecr:BatchGetImage",
             "ecr:BatchCheckLayerAvailability",
+            "ecr:BatchDeleteImage",
             "ecr:CompleteLayerUpload",
             "ecr:GetDownloadUrlForLayer",
             "ecr:InitiateLayerUpload",
