@@ -599,8 +599,6 @@ def event_handler(event, context):
     msg_group_id = repo_name
     if image_tag:
         msg_group_id += f":{image_tag}"
-    else:
-        msg_group_id += f"@{image_digest}"
 
     queue = sqs_rsrc.Queue(IMAGES_QUEUE)
     res = queue.send_message(
