@@ -18,7 +18,7 @@ import json
 import logging
 import os
 import sys
-from time import time
+from time import time, sleep
 from uuid import uuid4
 
 import boto3
@@ -277,7 +277,7 @@ def retrieve_records(item_id):
             {'id': item_id}
         )
         try:
-            table.delete_item(Key={'Id': item_id, 'Type': 'records'})
+            table.delete_item(Key={'ID': item_id, 'Type': 'records'})
         except Exception: # pylint: disable=broad-except
             logger.exception(
                 '[%(id)s] Unable to delete records',
@@ -312,7 +312,7 @@ def retrieve_results(item_id):
             {'id': item_id}
         )
         try:
-            table.delete_item(Key={'Id': item_id, 'Type': 'results'})
+            table.delete_item(Key={'ID': item_id, 'Type': 'results'})
         except Exception: # pylint: disable=broad-except
             logger.exception(
                 '[%(id)s] Unable to delete results',
@@ -430,7 +430,7 @@ def wait_for_build(build_id, phase, /, context, _logger):
             if build_status != 'IN_PROGRESS':
                 _logger.info(
                     'Build %(build_id)s reached %(phase)s: %(status)s',
-                    {'build_id': build_id, 'phase': build_phase, 'status': build_status}
+                    {'build_id': build_id, 'phase': build_phase.name, 'status': build_status}
                 )
                 return build
         elif build_phase > phase:
@@ -442,7 +442,7 @@ def wait_for_build(build_id, phase, /, context, _logger):
 
         if context.get_remaining_time_in_millis() <= 10000:
             break
-        time.sleep(10)
+        sleep(10)
 
     raise ValueError('Not enough time to wait for build')
 
