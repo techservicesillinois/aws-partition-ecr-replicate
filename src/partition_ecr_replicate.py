@@ -593,10 +593,16 @@ def event_handler(event, context):
         img_logger.debug('Skipping: %(type)s', {'type': action_type})
         return
 
+    msg_group_id = repo_name
+    if image_tag:
+        msg_group_id += f":{image_tag}"
+    else:
+        msg_group_id += f"@{image_digest}"
+
     queue = sqs_rsrc.Queue(IMAGES_QUEUE)
     res = queue.send_message(
         MessageBody=json.dumps(detail),
-        MessageGroupId=image_tag if image_tag else image_digest,
+        MessageGroupId=msg_group_id,
     )
 
     img_logger.info(
