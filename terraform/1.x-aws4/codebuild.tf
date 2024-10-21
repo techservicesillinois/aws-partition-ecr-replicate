@@ -86,7 +86,7 @@ data "aws_iam_policy_document" "this_worker" {
 # =========================================================
 
 resource "aws_iam_role" "this_worker" {
-    name_prefix = "${var.name}-worker-"
+    name_prefix = "${substr(var.name, 0, 30)}-worker-"
     path        = "/${var.name}/"
     description = "Role for the CodeBuild Project to replicate ECR Images between registries in different partitions."
 
